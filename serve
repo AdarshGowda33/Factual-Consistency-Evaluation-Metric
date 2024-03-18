@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+
+import pandas as pd
+import json
+import pandas as pd
+import numpy as np
+import zipfile
+from zipfile import ZipFile
+import os
+import io
+from flask_cors import CORS
+from flask import Flask,request,jsonify, Response
+import traceback
+import argparse
+import re
+import string
+from collections import Counter
+import spacy
+from tqdm import tqdm
+import boto3
+
+
+prefix = "/opt/program"
+# prefix = "/opt/ml"
+input_path = os.path.join(prefix, "input/data")
+output_path = os.path.join(prefix, "output")
+output_path1=os.path.join(output_path , "output.zip")
+channel_name = "inference"
+inference_path = os.path.join(input_path, channel_name)
+# inference_path="input/data/inference"
+
+app = Flask(__name__)
+cors = CORS(app, resources={r"*": {"origin": "*"}})
+
+@app.route("/ping", methods=["GET"])
+def ping():
+    status = 200
+    return Response(response="\n", status=status, mimetype="application/json")
+
+
+def clean_text(text):
+    text = text.lower()
+    # text = text.translate(str.maketrans('', '', string.punctuation))
+    text = text.translate(str.maketrans('', '', string.punctuation + '{}'))
+    text = re.sub(r'\b(a|an|the|in|our)\b', ' ', text)
+    return re.sub(' +', ' ', text).strip()
+
+
+def f1_score(r, k):
+    try:
+        f1score = []
+        for i in range(len([item for item in r if item != ''])):
+            gold_toks = clean_text(r[i]).split()
+            pred_toks = clean_text(k[i]).split()
+            common = Counter(gold_toks) & Counter(pred_toks)
+            num_same = sum(common.values())
+            if num_same == 0:
+                f1score.append(0)
+            else:
+                f1=num_same/min(len(pred_toks),len(gold_toks))            
+                f1score.append(f1)
+
+        top_3_f1scores = sorted(f1score, reverse=True)[:3]
+        length_f1score = len(f1score)
+
+        num_scores_to_consider = min(length_f1score, 3)  
+
+        mean_f1 = sum(top_3_f1scores) / num_scores_to_consider if num_scores_to_consider else 0
+
+        return mean_f1
+    except Exception:
+        return "'Not a valid query' OR 'response is not a factual extraction from context'"
+
+def f1_bert_score(a_gold, a_pred):
+    P, R, F1 = score(a_pred, a_gold, lang="en", verbose=True)
+    return F1.mean().item()
+
+def call_bedrock(prompt):
+    try:
+        with open(os.path.join(inference_path, "input_data/credentials.json"), 'r') as f:
+            credentials = json.load(f)
+
+        # Extract the keys
+        aws_access_key_id = credentials['aws_access_key_id']
+        aws_secret_access_key = credentials['aws_secret_access_key']
+        region_name = credentials['region_name']
+
+        # Call the bedrock client 
+        bedrock = boto3.client(service_name='bedrock-runtime',
+                               region_name=region_name,
+                               aws_access_key_id=aws_access_key_id,
+                               aws_secret_access_key=aws_secret_access_key)
+
+        # Tweak your preferred model parameters, prompt and assistant information
+        body = json.dumps({
+            "prompt": f"\n\nHuman:{prompt}\n\nAssistant:",
+            "max_tokens_to_sample": 1400,
+            "temperature": 0.1,
+            "top_p": 0.1,
+        })
+        
+        # Define the type of model that will be used 
+        modelId = 'anthropic.claude-instant-v1'
+        
+        accept = 'application/json'
+        contentType = 'application/json'
+
+        # Call the Bedrock API
+        response = bedrock.invoke_model(body=body, modelId=modelId, accept=accept, contentType=contentType)
+        response_body = json.loads(response.get('body').read())
+        return response_body.get('completion')
+
+    except Exception as e:
+        return '111'
+
+# Test out the call_bedrock function 
+
+def extract_keys_values(text):
+    values_list = []
+    keys_list=[]
+
+    pattern = r'\"(.*?)\":\"(.*?)\"'
+    matches = re.findall(pattern, text)
+
+    for key, value in matches:
+        keys_list.append(key)
+        values_list.append(value)
+
+    return keys_list, values_list
+
+def extract_values_from_text(text):
+    # Updated regex pattern to match the values after digit and colon, excluding the digits, colons, and trailing '>'
+    # pattern = r"\d+:\s*\"(.*?)\"(?=,|$|>)"
+    # pattern = r"\d+:\s*(.*?)(?=,|$|>|<)"
+    pattern=r"\d+:\s*([^:,<>\n]+)"
+    # Create an empty list
+    extracted_values = []
+
+    # Find all matches and append them to the list
+    matches = re.findall(pattern, text)
+    for match in matches:
+        extracted_values.append(match)
+
+    return extracted_values
+
+def generate_question_answer_pairs(n):
+    # Initialize an empty string to store the result
+    result = "<"
+    
+    # Loop through each question number from 1 to n
+    for i in range(1, n+1):
+        # Append the question-answer pair to the result string
+        result += f'"Question {i}":"Answer {i}"'
+        
+        # Add a comma and space if it's not the last pair
+        if i < n:
+            result += ", "
+    
+    # Add closing angle bracket to the result
+    result += ">"
+    
+    return result
+
+def get_questions_beam(context):
+    a=f"""
+      Assume that you are a quiz master. Given a context, your task is to generate 5 pairs of question answers from the given context. 
+      Generate only factual questions from the given context. The task 
+      The answers to these factual question should be excerpts from the given context itself.
+ 
+      <context>
+      {context}
+      
+      <End of context>
+      
+      Output the generated question answer pairs in the format given below.
+
+      <"Question 1":"Answer 1", "Question 2":"Answer 2", "Question 3":"Answer 3", Question 4":"Answer 4",Question 5":"Answer 5">
+      
+      If there are less than 5 question answer pairs, do not make them up. 
+      Output an empty string for them. Do not explain yourself for the answer you have given.
+      Make sure to stick to the output format.
+     
+     """
+    all_questions=call_bedrock(a)
+    
+    questions, response_answers = extract_keys_values(all_questions)
+    return questions, response_answers
+    
+    
+    
+def get_answer(context,l):
+    sl=str(l)
+    
+    a=f"""
+      Assume that you are a text extractor. 
+      Given a context and a list of questions, extract the answer for each of the question from the given context. 
+      Try to reason out your answer as well
+ 
+      <context>
+      {context}
+      
+      <End of context>
+      
+      List of question : {sl}
+      
+      Make sure to answer each question in the list in a purely extractive fashion and not an abstractive manner. 
+      Do not make up an answer for any question. 
+      If you are unable to find an answer to a question, say that you do not know. 
+      Output the answers to the question in the format given below.
+      <1:"",2:"",3:"",4:"",5:"">
+ 
+      Do not make up any answers. 
+      Answer the questions from the given context only. 
+      If you do not know the answer to any question say that you do not know. 
+      Make sure you stick to the output format.
+     
+     """
+    all_answers=call_bedrock(a)
+    # print("all_answers",all_answers)
+    
+    answer_knowledge=extract_values_from_text(all_answers)
+    return answer_knowledge
+    # print(answer_knowledge)
+    
+    
+
+def question_valid(query,context,response):
+    
+    a=f"""
+      Given the three columns query, context, and response, 
+      we aim to assess the factual correctness of the response by calculating a groundedness score between the context and 
+      the generated response.
+      
+      <query>
+      {query}
+      
+      <End of query>
+       
+      <context>
+      {context}
+      
+      <End of context>
+      
+      <response>
+      {response}
+      
+      <End of response>
+      
+      To compute groundedness score, we create pairs of factual questions from the response, with answers excerpted from the response itself. 
+      Then, we extract answers from the context for the same factual questions and compare them to the response. 
+      The groundedness score is determined by measuring the overlap of common words between the answers excerpted from both the context and the response.
+
+      It's important to note that this method can only be applied if the query is deemed valid. 
+      A query is considered valid if the response contains factual content extracted from the context, and 
+      response is the correct answer from the context for the given query.
+
+      Your task is to determine whether the provided query is valid or not. 
+      If it's valid, output <YES>; 
+      otherwise, output <NO>." 
+      Make sure you stick to the output format.
+     
+     """
+    all_answers=call_bedrock(a)
+    
+    return all_answers
+    
+    
+
+@app.route("/invocations", methods=["POST"])
+def data_extraction():
+    print("content type")
+    print(request.content_type)
+    if request.content_type == "application/zip":
+        try:
+            
+            request_data = request.data
+            # print("got data")
+            with open(os.path.join(inference_path ,"input_data.zip"), "wb") as f:
+                f.write(request_data)
+            input_zip_path =os.path.join(inference_path ,"input_data.zip")
+            # #input_dir_path = os.path.join(prefix ,"input_inference")
+            
+            with ZipFile (input_zip_path, "r") as data_zip:
+                print('Extracting all the files now...')
+                data_zip.extractall(inference_path)
+
+            # #print files in the directory
+            # print(os.listdir())
+            # input_dir_path_test = os.path.join(inference_path,"input_data")
+        
+         
+            # input_dir_path_test = os.path.join(input_dir_path_test,'input.json')
+            # print(input_dir_path_test)
+            with open(os.path.join(inference_path ,"input_data/input.json"), 'r') as f:
+                os.path.join(inference_path ,"input_data/input.json")
+                testData = json.load(f)
+            # testData = pd.read_json("input/data/user_input.json")
+            
+            ##checking claude model
+            chec=call_bedrock('abc')
+            if chec=='111':
+                return Response(response="Problem in anthropic model invocation, check for your credentials", status=200, mimetype='text/plain')
+            q_scores = []
+            # df=testData.copy()
+            df=pd.read_json(os.path.join(inference_path ,"input_data/input.json"))
+            print("input read")
+            df['is_valid'] = df.apply(lambda row:question_valid(row['query'], row['context'], row['response']), axis=1)
+            df['is_valid'] = df['is_valid'].astype(str)
+            df_yes = df[df['is_valid'] == ' <YES>']
+            df_no = df[df['is_valid'] == ' <NO>']
+            df_yes.reset_index(drop=True, inplace=True)
+            df_no.reset_index(drop=True, inplace=True)
+            df=df_yes[['context','response']]
+                
+            df.rename(columns={'context': 'knowledge'}, inplace=True)
+            df["knowledge"] = df["knowledge"].astype(str)
+            df["response"] = df["response"].astype(str)
+            new_df = pd.DataFrame(columns=['knowledge', 'response', 'questions', 'response_answers', 'knowledge_answers', 'Groundednesss_score'])
+            
+            for idx, row in tqdm(df.iterrows()):
+                questions, response_answer = get_questions_beam(row['response'])
+                knowledge_answer = get_answer(row['knowledge'], questions)
+                avg_f1 = f1_score(response_answer, knowledge_answer)
+                print(avg_f1)
+                new_row = pd.DataFrame([{
+            'knowledge': row['knowledge'],
+            'response': row['response'],
+            'questions': questions,
+            'response_answers': response_answer,
+            'knowledge_answers': knowledge_answer,
+            'Groundednesss_score': avg_f1
+                }])
+                new_df = pd.concat([new_df, new_row], ignore_index=True)
+                df=new_df.copy()
+    # new_df.to_csv('Q2_listing.csv', index=False)
+            df=df[['Groundednesss_score']]
+            combined_df = pd.concat([df_yes,df], axis=1)
+            df_no['Groundednesss_score'] = "'Not a valid query' OR 'response is not a factual extraction from context'"
+            combined_df1 = pd.concat([combined_df, df_no], ignore_index=True)
+            combined_df1.drop(columns=['is_valid'], inplace=True)
+            df_json = combined_df1.to_json(orient='records')
+            # custom_name = "output/output.json"
+            # with open(custom_name, 'w') as f:
+            #     f.write(df_json)
+            with zipfile.ZipFile(output_path1, 'w') as zipf:
+            # Add a file named 'data.json' to the zip file
+                with zipf.open('output.json', 'w') as f:
+                    # Write the JSON string to the file inside the zip
+                    f.write(df_json.encode('utf-8'))
+            # save_embeddings(df, SentenceTransformer(fine_tuned_model_path), output_path1)
+            print("output saved")
+
+            
+            
+            print("inference done")
+            #output_obj = open(output_embeddings_path, 'rb')
+            output_obj1=open(output_path1,'rb')
+
+            return Response(response=output_obj1, status=200, mimetype="application/zip")
+        
+        except Exception as e:
+            print(traceback.format_exc())
+    else:
+        return Response(
+            response="Please provide input folder as zip file",
+            status=400,
+            mimetype="text/plain",
+        )
+    
+
+if __name__ == '__main__':
+    app.run(debug=False, port=8080, host='0.0.0.0')
